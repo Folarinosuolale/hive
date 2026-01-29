@@ -8,12 +8,16 @@ Usage:
 """
 
 import json
+import logging
 import os
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
-
+ 
 from mcp.server import FastMCP
+ 
+# Module logger
+logger = logging.getLogger(__name__)
 
 from framework.graph import Constraint, EdgeCondition, EdgeSpec, Goal, NodeSpec, SuccessCriterion
 from framework.graph.plan import Plan
@@ -152,8 +156,14 @@ def _load_active_session() -> BuildSession | None:
 
         if session_id:
             return _load_session(session_id)
-    except Exception:
-        pass
+    except FileNotFoundError:
+        logger.warning("Active session file not found: %s", ACTIVE_SESSION_FILE)
+    except PermissionError as e:
+        logger.error("Permission denied reading active session file: %s", e)
+    except json.JSONDecodeError as e:
+        logger.error("Failed to parse session data: %s", e)
+    except Exception as e:
+        logger.error("Unexpected error loading active session: %s", e)
 
     return None
 
@@ -198,6 +208,7 @@ def list_sessions() -> str:
     _ensure_sessions_dir()
 
     sessions = []
+    skipped_files = []
     if SESSIONS_DIR.exists():
         for session_file in SESSIONS_DIR.glob("*.json"):
             try:
@@ -214,27 +225,42 @@ def list_sessions() -> str:
                             "has_goal": data.get("goal") is not None,
                         }
                     )
-            except Exception:
-                pass  # Skip corrupted files
-
+            except json.JSONDecodeError as e:
+                logger.warning("Skipping corrupted session file %s: %s", session_file.name, e)
+                skipped_files.append({"file": session_file.name, "error": f"Invalid JSON: {e}"})
+            except PermissionError as e:
+                logger.warning("Permission denied for session file %s: %s", session_file.name, e)
+                skipped_files.append({"file": session_file.name, "error": f"Permission denied: {e}"})
+            except KeyError as e:
+                logger.warning("Session file %s missing required field: %s", session_file.name, e)
+                skipped_files.append({"file": session_file.name, "error": f"Missing field: {e}"})
+            except Exception as e:
+                logger.warning("Unexpected error reading session file %s: %s", session_file.name, e)
+                skipped_files.append({"file": session_file.name, "error": str(e)})
+ 
     # Check which session is currently active
     active_id = None
     if ACTIVE_SESSION_FILE.exists():
         try:
             with open(ACTIVE_SESSION_FILE) as f:
                 active_id = f.read().strip()
-        except Exception:
-            pass
-
-    return json.dumps(
-        {
-            "sessions": sorted(sessions, key=lambda s: s["last_modified"], reverse=True),
-            "total": len(sessions),
-            "active_session_id": active_id,
-        },
-        indent=2,
-    )
-
+        except PermissionError as e:
+            logger.warning("Permission denied reading active session file: %s", e)
+        except Exception as e:
+            logger.warning("Error reading active session file: %s", e)
+ 
+    response = {
+        "sessions": sorted(sessions, key=lambda s: s["last_modified"], reverse=True),
+        "total": len(sessions),
+        "active_session_id": active_id,
+    }
+ 
+    # Include skipped files info if any were skipped
+    if skipped_files:
+        response["skipped_files"] = skipped_files
+        response["skipped_count"] = len(skipped_files)
+ 
+    return json.dumps(response, indent=2)
 
 @mcp.tool()
 def load_session_by_id(session_id: Annotated[str, "ID of the session to load"]) -> str:
